@@ -1,0 +1,1352 @@
+/*
+LoRaWAN Payload Decoder for Datacake (The Things Stack / Datacake LNS)
+
+- Entry point: Decoder(payload, port)
+- Decodes LoRaWAN uplinks by selecting a protocol parser based on f_port (switch inside decodeUplink).
+  If f_port is not supported, the decoder throws "Unknown protocol". 
+- Output format (Datacake): returns an array of measurements:
+    [{ field: "<field_name>", value: <value>, unit?: "<unit>" }, ...]
+  Units are included only when available and not "none".
+
+Supported input formats:
+1) Datacake standard:
+   - Decoder(<bytes_array>, <port>)
+2) Input object style:
+   - Decoder({ bytes: <bytes_array|hex|base64>, fPort: <number> })
+   - Decoder({ bytes: <bytes_array|hex|base64>, f_port: <number> })
+3) Full The Things Stack (TTS) uplink JSON (object):
+   - Extracts:
+       f_port  = payload.uplink_message.f_port
+       payload = payload.uplink_message.frm_payload   // Base64 string
+4) JSON string:
+   - If you paste the entire uplink JSON as a string, the decoder will try to JSON.parse() and re-run.
+
+Payload normalization:
+- If payload is a string:
+  - HEX string is used as-is
+  - Otherwise treated as Base64 (frm_payload style) and converted to bytes
+- For known protocols, the decoder can validate expected byte length.
+  Example: f_port=104 expects 51 bytes (408 bits). If length mismatch and Datacake provides global `b64payload`,
+  the decoder tries `b64payload` as a fallback.
+
+Error visibility:
+- On exception, the decoder returns measurements like:
+    DECODER_ERROR, DECODER_PORT, DECODER_HINT
+  so you can see the reason directly in Datacake debug UI.
+
+Expected uplink payload structure (minimal example):
+{
+  "end_device_ids": {
+    "device_id": "51d34246-ffb1-4cec-bb8a-b27432c1ef8a",
+    "dev_eui": "70B3D5387E021FC3"
+  },
+  "received_at": "2025-12-30T01:59:27.303Z",
+  "uplink_message": {
+    "f_port": 104,
+    "f_cnt": 44,
+    "frm_payload": "E4vo//+NGQAAO0AAAB9EVYcl/wSUBQEADwFkBQQAALn/9/8AAPX/+P/8//v/2//N/83/",
+    "rx_metadata": [
+      { "rssi": -102, "snr": 7 }
+    ]
+  }
+}
+*/
+
+function DataPoint(name, group, min, max, size, units, value) {
+    this.name = name;
+    this.min = min;
+    this.max = max;
+    this.size = size;
+    this.units = units;
+    this.value = value;
+    this.group = group;
+}
+
+DataPoint.prototype.parse = function(bits) {
+    if (bits.length !== this.size) {
+        throw new Error("Bit length mismatch for " + this.name + ": expected " + this.size + ", got " + bits.length);
+    }
+    var value = parseInt(bits, 2);
+    if (value < this.min || value > this.max) {
+        throw new Error("Value of " + this.name + " out of range: " + value + " (min: " + this.min + ", max: " + this.max + ")");
+    }
+
+    if (typeof this.value === "string" && this.value.charAt(0) === "#") {
+        var functionName = "decode" + this.value.slice(1);
+        if (typeof this[functionName] === "function") {
+            value = this[functionName](value);
+        } else {
+            throw new Error("No such function: " + functionName + " for " + this.name);
+        }
+
+    } else if (typeof this.value === "string" && this.value.charAt(0) === "[") {
+        var fn = "decodeLookUpTable";
+        if (typeof this[fn] === "function") {
+            value = this[fn](value, this.value);
+        } else {
+            throw new Error("No such function: " + fn + " for " + this.name);
+        }
+    }
+
+    return value;
+};
+
+DataPoint.prototype.decodeActualityDurationCompact = function(input) {
+    var duration = "";
+    if (input < 0 || input > 255) {
+        duration = "unknown";
+    } else if (input <= 59) {
+        duration = input + " minutes";
+    } else if (input > 59 && input < 152) {
+        var durationMin = ((input - 60) * 15) % 60;
+        var durationHour = Math.floor(((input - 60) * 15) / 60) + 1;
+        duration = durationHour + "h " + durationMin + "m";
+    } else if (152 <= input && input < 200) {
+        var durationDays = input - 152 + 1;
+        duration = durationDays + " days";
+    } else if (200 <= input && input < 245) {
+        var durationWeeks = input - 200 + 7;
+        duration = durationWeeks + " weeks";
+    } else if (245 <= input) {
+        var durationYear = 1;
+        duration = "more than " + durationYear + " years";
+    } else {
+        duration = "unknown";
+    }
+    return duration;
+};
+
+DataPoint.prototype.decodeManufacturer = function(input) {
+    input = input.toString();
+    var highByte = input.substring(0, 2);
+    var lowByte = input.substring(2, 4);
+    var valHB = parseInt(highByte, 10);
+    var valLB = parseInt(lowByte, 10);
+    var res = valHB * 256 + valLB;
+    var firstLetterCC = res / 32 / 32 + 64;
+    var firstLetter = String.fromCharCode(firstLetterCC);
+    var secondLetterCC = ((res / 32) % 32) + 64;
+    var secondLetter = String.fromCharCode(secondLetterCC);
+    var thirdLetterCC = (res % 32) + 64;
+    var thirdLetter = String.fromCharCode(thirdLetterCC);
+    return firstLetter.concat(secondLetter, thirdLetter);
+};
+
+DataPoint.prototype.decodeDateTypeG = function(input) {
+    // todo
+    return input;
+};
+
+function _parseLookupKey(key) {
+    key = (key || "").replace(/^\s+|\s+$/g, "");
+    if (key.indexOf("0x") === 0 || key.indexOf("0X") === 0) return parseInt(key.substring(2), 16);
+    if (key.indexOf("0b") === 0 || key.indexOf("0B") === 0) return parseInt(key.substring(2), 2);
+    if (/^[01]+$/.test(key)) return parseInt(key, 2);
+    return parseInt(key, 10);
+}
+
+DataPoint.prototype.decodeLookUpTable = function(value, table) {
+    // Remove the brackets and split the string into key-value pairs
+    table = table.slice(1, -1);
+    table = table.replace(/^\s+|\s+$/g, "");
+
+    var parts = table.split(",");
+    var lookup = {};
+    for (var i = 0; i < parts.length; i++) {
+        var part = parts[i];
+        if (part === null || part === undefined) continue;
+        part = part.replace(/^\s+|\s+$/g, "");
+        if (!part) continue;
+
+        var kv = part.split("=");
+        if (kv.length < 2) continue;
+
+        var key = kv[0].replace(/^\s+|\s+$/g, "");
+        var val = kv.slice(1).join("=").replace(/^\s+|\s+$/g, "");
+
+        var k = _parseLookupKey(key);
+        if (!isNaN(k)) lookup[k] = val;
+    }
+
+    if (lookup.hasOwnProperty(value)) {
+        return lookup[value];
+    }
+    return "undefined value: " + value;
+};
+// ===== end DataPoint =====
+
+function _padLeft(str, len, ch) {
+    str = String(str);
+    while (str.length < len) str = ch + str;
+    return str;
+}
+
+function hexToBin(hex) {
+    var out = "";
+    for (var i = 0; i < hex.length; i++) {
+        var c = hex.charAt(i);
+        var n = parseInt(c, 16);
+        if (isNaN(n)) {
+            throw new Error("Invalid hex character: " + c);
+        }
+        var bin = n.toString(2);
+        bin = _padLeft(bin, 4, "0");
+        out += bin;
+    }
+    return out;
+}
+function bitIterator(binInput) {
+    var i = 0;
+    var length = binInput.length;
+    return {
+        next: function() {
+            if (i >= length) return { value: undefined, done: true };
+            var reverseIndex = i - (i % 8) + (7 - (i % 8));
+            var v = binInput.charAt(reverseIndex);
+            i++;
+            return { value: v, done: false };
+        }
+    };
+}
+function parseDataPoints(binInput, dataPoints) {
+    var bitIter = bitIterator(binInput);
+    var parsedValues = [];
+    for (var idx = 0; idx < dataPoints.length; idx++) {
+        var dp = dataPoints[idx];
+        var bits = "";
+        for (var i = 0; i < dp.size; i++) {
+            var next = bitIter.next();
+            var bit = next.value;
+            if (bit === undefined) {
+                throw new Error("Not enough bits in input");
+            }
+            bits = bit + bits;
+        }
+        var value = dp.parse(bits);
+        parsedValues.push({ name: dp.name, value: value, units: dp.units, group: dp.group });
+    }
+    return parsedValues;
+}
+function lora2(hexInput) {
+    var dataPoints = [
+        new DataPoint("protocol_type",0,0,255,8,"none","none"),
+        new DataPoint("manufacturer",1,0,65535,16,"none","#Manufacturer"),
+        new DataPoint("meter_serial_number",2,0,99999999,32,"none","none"),
+        new DataPoint("meter_medium",3,0,7,8,"none","[0x03 = gas, 0x06 = warm water, 0x07 = water]"),
+        new DataPoint("meter_mbus_state",4,0,255,8,"none","none"),
+        new DataPoint("actuality_duration",5,0,65535,16,"minutes","none"),
+        new DataPoint("volume_vif",6,0,255,8,"none","none"),
+        new DataPoint("volume",6,0,4294967295,32,"none","none"),
+        new DataPoint("reserved0",7,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",8,0,1,1,"none","none"),
+        new DataPoint("reserved1",7,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",8,0,1,1,"none","none"),
+        new DataPoint("reserved3",7,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",8,0,1,1,"none","none"),
+        new DataPoint("back_flow_alarm",8,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",8,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",8,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("remaining_battery_life_time",9,0,31,5,"semester","none"),
+        new DataPoint("reserved4",7,0,0,2,"none","none"),
+        new DataPoint("checksum",10,0,65535,16,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora3(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water US Gal, 4 = Warm Water US Gal, 5 = Water ft³, 6 = Warm Water ft³, 7 = Unknown]"),
+        new DataPoint("volume_multiplier",0,0,7,4,"none","[ 0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",3,0,99999999,27,"none","none"),
+        new DataPoint("no_connection_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_eco_frame_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_com_alarm",4,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",4,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",4,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",4,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",4,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("reserved0",5,0,1,1,"none","none"),
+        new DataPoint("reserved1",5,0,1,1,"none","none"),
+        new DataPoint("reserved2",5,0,1,1,"none","none"),
+        new DataPoint("reserved3",5,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",6,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora4(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water US Gal, 4 = Warm Water US Gal, 5 = Water ft³, 6 = Warm Water ft³, 7 = Unknown]"),
+        new DataPoint("volume_multiplier",0,0,7,4,"none","[ 0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",3,0,99999999,27,"none","none"),
+        new DataPoint("no_connection_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_eco_frame_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_com_alarm",4,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",4,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",4,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",4,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",4,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("reserved0",5,0,1,1,"none","none"),
+        new DataPoint("reserved1",5,0,1,1,"none","none"),
+        new DataPoint("reserved2",5,0,1,1,"none","none"),
+        new DataPoint("reserved3",5,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",6,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("key_date",0,0,65535,16,"none","#DateTypeG"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora5(hexInput) {
+    var dataPoints = [
+        new DataPoint("protocol_type",0,0,255,8,"none","none"),
+        new DataPoint("manufacturer",1,0,65535,16,"none","#Manufacturer"),
+        new DataPoint("meter_serial_number",2,0,4294967295,32,"none","none"),
+        new DataPoint("meter_medium",3,0,7,8,"none","[ 0x03 = gas, 0x06 = warm water, 0x07 = water ]"),
+        new DataPoint("meter_mbus_state",3,0,255,8,"none","none"),
+        new DataPoint("actuality_duration",5,0,65535,16,"minutes","none"),
+        new DataPoint("volume_vif",6,0,255,8,"none","none"),
+        new DataPoint("volume",6,0,268435455,32,"none","none"),
+        new DataPoint("key_date",7,0,65535,16,"none","#DateTypeG"),
+        new DataPoint("additional_functions",8,0,128,8,"none","none"),
+        new DataPoint("remaining_battery_life_time",9,0,128,8,"semester","none"),
+        new DataPoint("checksum",10,0,65535,16,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora6(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water US Gal, 4 = Warm Water US Gal, 5 = Water ft³, 6 = Warm Water ft³, 7 = Unknown]"),
+        new DataPoint("volume_multiplier",0,0,7,4,"none","[ 0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",3,0,99999999,27,"none","none"),
+        new DataPoint("no_connection_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_eco_frame_alarm",4,0,1,1,"none","none"),
+        new DataPoint("meter_com_alarm",4,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",4,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",4,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",4,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",4,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",4,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("reserved0",5,0,1,1,"none","none"),
+        new DataPoint("reserved1",5,0,1,1,"none","none"),
+        new DataPoint("reserved2",5,0,1,1,"none","none"),
+        new DataPoint("reserved3",5,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",6,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("actual_flow",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("max_flow_last_month",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("time_since_highest_flow_last_month",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora7(hexInput) {
+    var dataPoints = [
+        new DataPoint("#lora003",0,0,0,88,"n/a","none"),
+        new DataPoint("key_date",0,0,65535,16,"none","#DateTypeG"),
+        new DataPoint("actual_flow",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("max_flow_last_month",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("time_since_highest_flow_last_month",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora10(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water ft³]"),
+        new DataPoint("volume_multiplier",0,0,15,4,"none","[0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",0,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora11(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water ft³]"),
+        new DataPoint("volume_multiplier",0,0,15,4,"none","[0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",0,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("key_date",0,0,65535,16,"none","#DateTypeG"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora12(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume",0,0,999999999,30,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,15,4,"year","none"),
+        new DataPoint("meter_medium",0,0,6,3,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_downlink_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("volume_multiplier",0,0,7,3,"none","[0 = 10⁻⁵, 1 = 10⁻⁴, 2 = 10⁻³, 3 = 10⁻², 4 = 10⁻¹, 5 = 10⁰, 6 = 10¹, 7 = 10² ]"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora13(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume",0,0,999999999,30,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,15,4,"year","none"),
+        new DataPoint("meter_medium",0,0,6,3,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_downlink_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("volume_multiplier",0,0,7,3,"none","[0 = 10⁻⁵, 1 = 10⁻⁴, 2 = 10⁻³, 3 = 10⁻², 4 = 10⁻¹, 5 = 10⁰, 6 = 10¹, 7 = 10² ]"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("key_date",0,0,65535,16,"none","DateTypeG"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora14(hexInput) {
+    var dataPoints = [
+        new DataPoint("protocol_type",0,0,255,8,"none","none"),
+        new DataPoint("manufacturer",0,0,255,16,"none","#Manufacturer"),
+        new DataPoint("meter_id",0,0,255,32,"none","none"),
+        new DataPoint("meter_medium",0,0,7,8,"none","[0x03 = gas, 0x06 = warm water, 0x07 = water]"),
+        new DataPoint("meter_mbus_state",0,0,255,8,"none","none"),
+        new DataPoint("actuality_duration",0,0,65535,16,"minutes","none"),
+        new DataPoint("volume_vif",0,0,255,8,"m³","none"),
+        new DataPoint("volume",0,0,4294967295,32,"m³","none"),
+        new DataPoint("volume_key_date_value_monthly",0,0,4294967295,32,"m³","none"),
+        new DataPoint("key_date",0,0,65535,16,"none","none"),
+        new DataPoint("volume_key_date_value_yearly",0,0,4294967295,32,"m³","none"),
+        new DataPoint("key_date",0,0,65535,16,"none","none"),
+        new DataPoint("additional_functions",0,0,128,8,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,128,8,"semester","none"),
+        new DataPoint("checksum",0,0,65535,16,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora15(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume",0,0,999999999,30,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,15,4,"year","none"),
+        new DataPoint("meter_medium",0,0,6,3,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_downlink_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("volume_multiplier",0,0,7,3,"none","[0 = 10⁻⁵, 1 = 10⁻⁴, 2 = 10⁻³, 3 = 10⁻², 4 = 10⁻¹, 5 = 10⁰, 6 = 10¹, 7 = 10² ]"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("actual_flow",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("max_flow_last_month",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("time_since_highest_flow_last_month",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora16(hexInput) {
+    var dataPoints = [
+        new DataPoint("#lora012",0,0,0,88,"n/a","none"),
+        new DataPoint("key_date",0,0,65535,16,"none","DateTypeG"),
+        new DataPoint("actual_flow",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("max_flow_last_month",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("time_since_highest_flow_last_month",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora22(hexInput) {
+    var dataPoints = [
+        new DataPoint("heat_or_cold_energy",0,0,99999999,27,"none",""),
+        new DataPoint("heat_or_cold_energy_multiplier",0,0,1,1,"none","[0 = 1e-1, 1 = 1e0 ]"),
+        new DataPoint("heat_or_cold_energy_units",0,0,1,1,"none","[0 = kWh, 1 = MJ ]"),
+        new DataPoint("energy_type",0,0,1,1,"none","[0 = heat, 1 = cold ]"),
+        new DataPoint("both_energy_value_changes",0,0,1,1,"none","[0 = only 1 or 0 energy values changed, 1 = both energy values changed ]"),
+        new DataPoint("radio_down_link_alarm",3,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("cumulated_volume",2,0,99999999,27,"none",""),
+        new DataPoint("cumulated_volume_multiplier",2,0,3,2,"liter","[0 = 1e0, 1=1e1, 2=1e2, 3=1e3]"),
+        new DataPoint("meter_reports_temporary_alarm",3,0,1,1,"none","[0 = no error, 1 = temporary meter error]"),
+        new DataPoint("meter_reports_permanent_alarm",3,0,1,1,"none","[0 = no error, 1 = permanent meter error]"),
+        new DataPoint("connection_alarm",3,0,1,1,"none","[0 = no error, 1 = meter connection response error]"),
+        new DataPoint("meter_changed",3,0,1,1,"none","[0 = no error, 1 = meter changed]"),
+        new DataPoint("reserved",1,0,0,3,"none",""),
+        new DataPoint("inlet_temperature",4,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("outlet_temperature",4,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora23(hexInput) {
+    var dataPoints = [
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none",""),
+        new DataPoint("meter_battery_low_alarm",1,0,1,1,"none","[0 = no error, 1 = meter battery low]"),
+        new DataPoint("radio_battery_low_alarm",1,0,1,1,"none","[0 = no error, 1 = radio battery low]"),
+        new DataPoint("reserved",2,0,0,3,"none",""),
+        new DataPoint("heat_energy",3,0,99999999,27,"none",""),
+        new DataPoint("cold_energy",3,0,99999999,27,"none",""),
+        new DataPoint("energy_multiplier",3,0,1,1,"none","[0 = 1e-1, 1 = 1e0]"),
+        new DataPoint("energy_units",3,0,1,1,"none","[0 = kWh, 1 = MJ]"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora24(hexInput) {
+    var dataPoints = [
+        new DataPoint("heat_or_cold_energy",0,0,99999999,27,"none",""),
+        new DataPoint("heat_or_cold_energy_multiplier",0,0,1,1,"none","[0 = 1e-1, 1 = 1e0 ]"),
+        new DataPoint("heat_or_cold_energy_units",0,0,1,1,"none","[0 = kWh, 1 = MJ ]"),
+        new DataPoint("energy_type",0,0,1,1,"none","[0 = heat, 1 = cold ]"),
+        new DataPoint("both_energy_value_changes",0,0,1,1,"none","[0 = only 1 or 0 energy values changed, 1 = both energy values changed ]"),
+        new DataPoint("radio_down_link_alarm",3,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("cumulated_volume",2,0,99999999,27,"none",""),
+        new DataPoint("cumulated_volume_multiplier",2,0,3,2,"liter","[0 = 1e0, 1=1e1, 2=1e2, 3=1e3]"),
+        new DataPoint("meter_reports_temporary_alarm",3,0,1,1,"none","[0 = no error, 1 = temporary meter error]"),
+        new DataPoint("meter_reports_permanent_alarm",3,0,1,1,"none","[0 = no error, 1 = permanent meter error]"),
+        new DataPoint("connection_alarm",3,0,1,1,"none","[0 = no error, 1 = meter connection response error]"),
+        new DataPoint("meter_changed",3,0,1,1,"none","[0 = no error, 1 = meter changed]"),
+        new DataPoint("reserved",1,0,0,3,"none",""),
+        new DataPoint("inlet_temperature",4,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("outlet_temperature",4,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none",""),
+        new DataPoint("meter_battery_low_alarm",1,0,1,1,"none","[0 = no error, 1 = meter battery low]"),
+        new DataPoint("radio_battery_low_alarm",1,0,1,1,"none","[0 = no error, 1 = radio battery low]"),
+        new DataPoint("reserved",2,0,0,3,"none",""),
+        new DataPoint("heat_energy",3,0,99999999,27,"none",""),
+        new DataPoint("cold_energy",3,0,99999999,27,"none",""),
+        new DataPoint("energy_multiplier",3,0,1,1,"none","[0 = 1e-1, 1 = 1e0]"),
+        new DataPoint("energy_units",3,0,1,1,"none","[0 = kWh, 1 = MJ]"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora42(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,999999999999,40,"0.001",""),
+        new DataPoint("cumulative_volume_unit",0,0,4,3,"none","[0 = m3, 1 = gal, 2=igal, 3=ft³, 4 = acre_feet ]"),
+        new DataPoint("water_temperature",1,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("air_in_pipe_alarm",2,0,1,1,"none","[0 = no error, 1 = air in pipe alarm ]"),
+        new DataPoint("reverse_flow_alarm",2,0,1,1,"none","[0 = no error, 1 = reverse flow alarm ]"),
+        new DataPoint("leak_alarm_alarm",2,0,1,1,"none","[0 = no error, 1 = leak alarm]"),
+        new DataPoint("back_flow_alarm",2,0,1,1,"none","[0 = no error, 1 = burst pipe alarm]"),
+        new DataPoint("no_usage_alarm",2,0,1,1,"none","[0 = no error, 1 = no usage alarm  ]"),
+        new DataPoint("water_temperature_alarm",2,0,1,1,"none","[0 = no error, 1 = water temperature alarm ]"),
+        new DataPoint("meter_ambient_temperature_alarm",2,0,1,1,"none","[0 = no error, 1 = meter ambient temperature alarm ]"),
+        new DataPoint("meter_no_external_power_supply_alarm",2,0,1,1,"none","[0 = no error, 1 = meter no external power ]"),
+        new DataPoint("reserved",5,0,0,3,"none",""),
+        new DataPoint("meter_mbus_state_eco_e2",3,0,255,8,"none","[0 = no error, 0x30 = no physical connection, 0xb0 = physical connection, no response, 0x50 = frame error, 0x13 any alarm ]"),
+        new DataPoint("actuality_duration",4,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("connection_alarm",2,0,1,1,"none","[0 = no error, 1 = no connection alarm ]"),
+        new DataPoint("radio_down_link_alarm",2,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("meter_changed",2,0,1,1,"none","[0 = no error, 1 = meter changed ]"),
+        new DataPoint("reserved",5,0,0,5,"none",""),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora43(hexInput) {
+    var dataPoints = [
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none",""),
+        new DataPoint("meter_medium",1,0,7,4,"none","[0 = water, 1 = warm water, 2 = gas, 7 = Unknown ]"),
+        new DataPoint("radio_battery_low_alarm",2,0,1,1,"none","[0 = no error, 1 = radio battery low]"),
+        new DataPoint("reverse_volume",3,0,999999999999,40,"0.001",""),
+        new DataPoint("reverse_volume_unit",3,0,4,3,"none","[0 = m³, 1 = gal, 2=igal, 3=ft³, 4 = acre_feet ]"),
+        new DataPoint("reserved",4,0,0,5,"none",""),
+        new DataPoint("meter_mbus_version",5,0,255,8,"none",""),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora44(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,999999999999,40,"0.001",""),
+        new DataPoint("cumulative_volume_unit",0,0,4,3,"none","[0 = m³, 1 = gal, 2=igal, 3=m³, 4 = acre_feet ]"),
+        new DataPoint("water_temperature",1,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("air_in_pipe_alarm",2,0,1,1,"none","[0 = no error, 1 = air in pipe alarm ]"),
+        new DataPoint("reverse_flow_alarm",2,0,1,1,"none","[0 = no error, 1 = reverse flow alarm ]"),
+        new DataPoint("broken_pipe_alarm",2,0,1,1,"none","[0 = no error, 1 = leak alarm]"),
+        new DataPoint("back_flow_alarm",2,0,1,1,"none","[0 = no error, 1 = burst pipe alarm]"),
+        new DataPoint("no_usage_alarm",2,0,1,1,"none","[0 = no error, 1 = no usage alarm  ]"),
+        new DataPoint("water_temperature_alarm",2,0,1,1,"none","[0 = no error, 1 = water temperature alarm ]"),
+        new DataPoint("meter_ambient_temperature_alarm",2,0,1,1,"none","[0 = no error, 1 = ambient temperature alarm ]"),
+        new DataPoint("meter_no_external_power_supply_alarm",2,0,1,1,"none","[0 = no error, 1 = meter no external power ]"),
+        new DataPoint("meter_communication_firmware_validation_failed_alarm",2,0,1,1,"none","[0 = no error, 1 = communication firmware validation failed ]"),
+        new DataPoint("meter_internal_error_alarm",2,0,1,1,"none","[0 = no error, 1 = meter internal error ]"),
+        new DataPoint("meter_aes_encryption_alarm",2,0,1,1,"none","[0 = no error, 1 = AES encryption alarm ]"),
+        new DataPoint("meter_state",3,0,255,8,"none","[0 = no error, 0x30 = no physical connection, 0xb0 = physical connection, no response, 0x50 = frame error, 0x13 any alarm ]"),
+        new DataPoint("actuality_duration",4,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("connection_alarm",2,0,1,1,"none","[0 = no error, 1 = no connection alarm ]"),
+        new DataPoint("radio_down_link_alarm",2,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("reserved",5,0,0,2,"none",""),
+        new DataPoint("meter_medium",3,0,15,4,"none","[0 = Water, 1 = Warm Water, 2 = Gas, 7 = Unknown Medium ]"),
+        new DataPoint("meter_serial_number",6,0,99999999,27,"none",""),
+        new DataPoint("meter_remaining_battery_life_time",7,0,31,5,"Semester",""),
+        new DataPoint("reverse_volume",0,0,999999999999,40,"0.001",""),
+        new DataPoint("meter_mbus_state_eco_e2",3,0,255,8,"none","[0 = no error, 0x30 = no physical connection, 0xb0 = physical connection, no response, 0x50 = frame error, 0x13 any alarm ]"),
+        new DataPoint("meter_ambient_temperature",1,0,1023,10,"0.1°C","[1023 = sensor error, * = temperature]"),
+        new DataPoint("radio_battery_low_alarm",2,0,1,1,"none","[0 = no error, 1 = radio Battery Low Alarm ]"),
+        new DataPoint("reserved",5,0,1,1,"none",""),
+        new DataPoint("flow_unit",9,0,15,4,"none","[0 = m³/h, 1 = m³/min, 3 = liter/h, 4 = liter/min, 5 = liter/s, 7 = USGal/min, 9 = Igal/h, 10 = Igal/min, 11 = Igal/s, 12 = ft³/h, 13 = ft³/min, 14 = ft³/s, 15 = other ]"),
+        new DataPoint("flow",9,0,2147483647,32,"none",""),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora50(hexInput) {
+    var dataPoints = [
+        new DataPoint("protocol_type",0,0,255,8,"none","none"),
+        new DataPoint("manufacturer",0,0,255,16,"none","#Manufacturer"),
+        new DataPoint("meter_serial_number",0,0,99999999,32,"none","none"),
+        new DataPoint("meter_medium",0,0,7,8,"none","[0x03 = gas, 0x06 = warm water, 0x07 = water]"),
+        new DataPoint("meter_mbus_state",0,0,0,8,"none","none"),
+        new DataPoint("actuality_duration",0,0,65535,16,"minutes","none"),
+        new DataPoint("volume_vif",0,0,22,8,"m³","none"),
+        new DataPoint("volume_key_date_value_monthly",0,0,4294967295,32,"m³","none"),
+        new DataPoint("key_date",0,0,65535,16,"none","#DateTypeG"),
+        new DataPoint("additional_functions",0,0,128,8,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,128,8,"semester","none"),
+        new DataPoint("checksum",0,0,65535,16,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora100(hexInput) {
+    var dataPoints = [
+        new DataPoint("ci_field",0,0,255,8,"none","none"),
+        new DataPoint("volume_dif",0,0,4,8,"none","none"),
+        new DataPoint("volume_vif",0,0,22,8,"none","[ 0x12=10⁻⁴m³,0x13=10⁻³m³,0x14=10⁻²m³,0x15=10⁻¹m³,0x16=10⁰m³]"),
+        new DataPoint("volume_lsb",0,0,4294967295,32,"none","none"),
+        new DataPoint("volume_key_date_dif",0,0,68,8,"none","none"),
+        new DataPoint("volume_key_date_vif",0,0,22,8,"none","[ 0x12=10⁻⁴m³,0x13=10⁻³m³,0x14=10⁻²m³,0x15=10⁻¹m³,0x16=10⁰m³]"),
+        new DataPoint("volume_key_date_lsb",0,0,4294967295,32,"none","none"),
+        new DataPoint("key_date_dif",0,0,66,8,"none","none"),
+        new DataPoint("key_date_vif",0,0,108,8,"none","none"),
+        new DataPoint("key_date_lsb",0,0,65535,16,"none","none"),
+        new DataPoint("remaining_battery_life_time_dif",0,0,2,8,"none","none"),
+        new DataPoint("remaining_battery_life_time_vif",0,0,253,8,"none","none"),
+        new DataPoint("remaining_battery_life_time_vife",0,0,116,8,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,65535,16,"none","none"),
+        new DataPoint("error_flags_dif",0,0,3,8,"none","none"),
+        new DataPoint("error_flags_vif",0,0,253,8,"none","none"),
+        new DataPoint("error_flags_vife",0,0,23,8,"none","none"),
+        new DataPoint("reserved0",1,0,0,1,"none","none"),
+        new DataPoint("tampering_alarm",0,0,1,1,"none","none"),
+        new DataPoint("water_leak_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("air_in_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("empty_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved1",1,0,0,1,"none","none"),
+        new DataPoint("water_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved2",1,0,0,1,"none","none"),
+        new DataPoint("malfunction_alarm",0,0,1,1,"none","none"),
+        new DataPoint("warning_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved3",1,0,0,2,"none","none"),
+        new DataPoint("nfc_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ipc_alarm",0,0,1,1,"none","none"),
+        new DataPoint("external_flash_alarm",0,0,1,1,"none","none"),
+        new DataPoint("config_alarm",0,0,1,1,"none","none"),
+        new DataPoint("rtc_alarm",0,0,1,1,"none","none"),
+        new DataPoint("unexpected_reset_alarm",0,0,1,1,"none","none"),
+        new DataPoint("lora_downlink_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("battery_low_alarm",0,0,1,1,"none","none"),
+        new DataPoint("volume_reverse_dif",0,0,4,8,"none","none"),
+        new DataPoint("volume_reverse_vif",0,0,150,8,"none","[0x92=10⁻⁴,0x93=10⁻³,0x94=10⁻²,0x95=10⁻¹, 0x96=10⁰]"),
+        new DataPoint("volume_reverse_vife",0,0,60,8,"m³","none"),
+        new DataPoint("volume_reverse",0,0,4294967295,32,"none","none"),
+        new DataPoint("flow_dif",0,0,51,8,"none","none"),
+        new DataPoint("flow_dif",0,0,63,8,"none","none"),
+        new DataPoint("flow_lsb",0,0,16777215,24,"none","none"),
+        new DataPoint("water_temperature_dif",0,0,50,8,"none","none"),
+        new DataPoint("water_temperature_vif",0,0,91,8,"none","[0x58=10⁻³ ,0x59=10⁻² ,0x5A=10⁻¹ ,0x5B=1]"),
+        new DataPoint("water_temperature",0,0,65535,16,"°C","none"),
+        new DataPoint("ambient_temperature_dif",0,0,2,8,"none","none"),
+        new DataPoint("ambient_temperature_vif",0,0,103,8,"none","[0x64=10⁻³ ,0x65=10⁻² ,0x66=10⁻¹ °C,0x67=1]"),
+        new DataPoint("ambient_temperature",0,0,65535,16,"°C","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora101(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume",0,0,999999999,30,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,31,5,"semester","none"),
+        new DataPoint("unit_and_medium",0,0,3,2,"none","none"),
+        new DataPoint("volume_multiplier",0,0,1000,4,"none","none"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("water_temperature",0,0,127,7,"°C","none"),
+        new DataPoint("malfunction",0,0,1,1,"none","none"),
+        new DataPoint("tampering_alarm",0,0,1,1,"none","none"),
+        new DataPoint("water_leak_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("air_in_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("empty_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("water_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("com_met_communication_alarm",0,0,1,1,"none","none"),
+        new DataPoint("internal_critical_alarm",0,0,1,1,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora102(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume",0,0,999999999,30,"none","none"),
+        new DataPoint("remaining_battery_life_time",0,0,31,5,"semester","none"),
+        new DataPoint("unit_and_medium",0,0,3,2,"none","none"),
+        new DataPoint("volume_multiplier",0,0,1000,4,"none","none"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("water_temperature",0,0,127,7,"°C","none"),
+        new DataPoint("malfunction",0,0,1,1,"none","none"),
+        new DataPoint("tampering_alarm",0,0,1,1,"none","none"),
+        new DataPoint("water_leak_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("air_in_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("empty_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("water_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("com_met_communication_alarm",0,0,1,1,"none","none"),
+        new DataPoint("internal_critical_alarm",0,0,1,1,"none","none"),
+        new DataPoint("due_date_timestamp",0,0,65535,16,"none","#DateTypeG"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora104(hexInput) {
+    var dataPoints = [
+        new DataPoint("volume_dif",0,0,22,8,"m³","[0x12=10⁻⁴,0x13=10⁻³,0x14=10⁻²,0x15=10⁻¹,0x16=10⁰]"),
+        new DataPoint("volume_lsb",0,0,4294967295,32,"various","none"),
+        new DataPoint("reverse_volume_lsb",0,0,4294967295,32,"none","none"),
+        new DataPoint("time_diff",0,0,255,8,"none","none"),
+        new DataPoint("reserved0",1,0,0,1,"none","none"),
+        new DataPoint("tampering_alarm",0,0,1,1,"none","none"),
+        new DataPoint("leakage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("air_in_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("empty_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("back_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved1",1,0,0,1,"none","none"),
+        new DataPoint("water_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved2",1,0,0,1,"none","none"),
+        new DataPoint("malfunction_alarm",0,0,1,1,"none","none"),
+        new DataPoint("warning_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved3",1,0,0,2,"none","none"),
+        new DataPoint("nfc_warning_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ipc_alarm",0,0,1,1,"none","none"),
+        new DataPoint("external_flash_alarm",0,0,1,1,"none","none"),
+        new DataPoint("config_alarm",0,0,1,1,"none","none"),
+        new DataPoint("rtc_alarm",0,0,1,1,"none","none"),
+        new DataPoint("unexpected_reset_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",0,0,1,1,"none","none"),
+        new DataPoint("battery_low_alarm",0,0,1,1,"none","none"),
+        new DataPoint("battery_lifetime",0,0,16777215,6,"none","none"),
+        new DataPoint("configuration_change_alarm",0,0,1,1,"none","none"),
+        new DataPoint("power_saving_scheme_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_serial_number",0,0,4294967295,32,"none","none"),
+        new DataPoint("water_temperature",0,0,65535,16,"0.01°C","none"),
+        new DataPoint("ambient_temperature",0,0,65535,16,"0.01°C","none"),
+        new DataPoint("max_flow_previous_day",0,0,65535,16,"liter_per_hour","none"),
+        new DataPoint("min_flow_previous_day",0,0,65535,16,"liter_per_hour","none"),
+        new DataPoint("max_flow_temperature_previous_day",0,0,65535,16,"celcius","none"),
+        new DataPoint("compact_control_scaler",0,0,3,2,"m³","[0 = 10⁻³, 1 = 10⁻², 2= 10⁻¹, 3 = 1]"),
+        new DataPoint("compact_control_period",0,0,7,3,"none","[0 = 15 minutes, 1 = hourly, 2 = daily, 3 = monthly]"),
+        new DataPoint("not_used",0,0,0,3,"various","none"),
+        new DataPoint("volume_2_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_3_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_4_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_5_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_6_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_7_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_8_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_9_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_10_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_11_difference",0,0,65535,16,"various","none"),
+        new DataPoint("volume_12_difference",0,0,65535,16,"various","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora180(hexInput) {
+    var dataPoints = [
+        new DataPoint("year",0,0,256,8,"years","none"),
+        new DataPoint("month",0,0,11,8,"months","none"),
+        new DataPoint("day",0,0,31,8,"days","none"),
+        new DataPoint("weekday",0,0,6,8,"weekdays","none"),
+        new DataPoint("hour",0,0,24,8,"hours","none"),
+        new DataPoint("minutes",0,0,59,8,"minutes","none"),
+        new DataPoint("seconds",0,0,59,8,"seconds","none"),
+        new DataPoint("ambient_temperature",0,-128,127,8,"°C","none"),
+        new DataPoint("soc",0,0,100,8,"%","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora181(hexInput) {
+    var dataPoints = [
+        new DataPoint("cumulative_volume",0,0,99999999,27,"none","none"),
+        new DataPoint("remaining_battery_life_time",1,0,31,5,"semester","none"),
+        new DataPoint("meter_medium",2,0,7,4,"none","[0 = Water m³, 1 = Warm Water m³, 2 = Gas m³, 3 = Water gal, 4 = Warm Water gal, 5 = Water ft³, 6 = Warm Water ft³]"),
+        new DataPoint("volume_multiplier",0,0,15,4,"none","[0 = 10⁻³, 1 = 10⁻², 2 = 10⁻¹, 3 = 10⁰, 4 = 10¹, 5 = 10², 6 = 10³, 7 = 10⁴]"),
+        new DataPoint("meter_serial_number",0,0,99999999,27,"none","none"),
+        new DataPoint("meter_error_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_check_failure_alarm",0,0,1,1,"none","none"),
+        new DataPoint("meter_error_or_no_response_alarm",0,0,1,1,"none","none"),
+        new DataPoint("broken_pipe_alarm",0,0,1,1,"none","none"),
+        new DataPoint("low_battery_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reverse_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("continuous_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("no_usage_alarm",0,0,1,1,"none","none"),
+        new DataPoint("radio_down_link_alarm",0,0,1,1,"none","[0 = no error, 1 = radio down link alarm ]"),
+        new DataPoint("max_flow_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_minimum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("ambient_temperature_maximum_alarm",0,0,1,1,"none","none"),
+        new DataPoint("reserved",0,0,1,1,"none","none"),
+        new DataPoint("actuality_duration",0,0,255,8,"none","#ActualityDurationCompact"),
+        new DataPoint("flow",0,0,4294967295,32,"none","none"),
+        new DataPoint("direction_count",0,0,4294967295,32,"none","none"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+function lora257(hexInput) {
+    var dataPoints = [
+        new DataPoint("actual_flow",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("max_flow_last_month",0,0,65535,16,"10 liter/h","none"),
+        new DataPoint("time_since_highest_flow_last_month",0,0,255,8,"none","#ActualityDurationCompact"),
+        
+    ];
+
+    var binInput = hexToBin(hexInput);
+    return parseDataPoints(binInput, dataPoints);
+}
+
+
+function bytesToHex(byteArray) {
+    var hexString = '';
+    for (var i = 0; i < byteArray.length; i++) {
+        var hex = (byteArray[i] & 0xFF).toString(16);
+        hexString += (hex.length === 1 ? '0' : '') + hex;
+    }
+    return hexString;
+}
+function decodeUplink(input) {
+    var actual_len  = 0;
+    var hexString = "";
+
+    if( (typeof Uint8Array !== 'undefined' && input.bytes instanceof Uint8Array) || (typeof Array !== 'undefined' && Array.isArray && Array.isArray(input.bytes)) || Object.prototype.toString.call(input.bytes)==='[object Array]') {
+        hexString = bytesToHex(input.bytes);
+        actual_len = hexString.length*4;
+    } else {
+        hexString = input.bytes;
+        actual_len = hexString.length*4;
+    }
+
+    var parsedValues = [];
+    switch( input.fPort ){
+        
+        case 2:
+            if (160 !== actual_len) {
+                throw new Error("Invalid input length for protocol 2: expected 160 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora2(hexString);
+            break;
+        
+        case 3:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 3: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora3(hexString);
+            break;
+        
+        case 4:
+            if (104 !== actual_len) {
+                throw new Error("Invalid input length for protocol 4: expected 104 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora4(hexString);
+            break;
+        
+        case 5:
+            if (176 !== actual_len) {
+                throw new Error("Invalid input length for protocol 5: expected 176 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora5(hexString);
+            break;
+        
+        case 6:
+            if (128 !== actual_len) {
+                throw new Error("Invalid input length for protocol 6: expected 128 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora6(hexString);
+            break;
+        
+        case 7:
+            if (144 !== actual_len) {
+                throw new Error("Invalid input length for protocol 7: expected 144 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora7(hexString);
+            break;
+        
+        case 10:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 10: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora10(hexString);
+            break;
+        
+        case 11:
+            if (104 !== actual_len) {
+                throw new Error("Invalid input length for protocol 11: expected 104 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora11(hexString);
+            break;
+        
+        case 12:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 12: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora12(hexString);
+            break;
+        
+        case 13:
+            if (104 !== actual_len) {
+                throw new Error("Invalid input length for protocol 13: expected 104 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora13(hexString);
+            break;
+        
+        case 14:
+            if (256 !== actual_len) {
+                throw new Error("Invalid input length for protocol 14: expected 256 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora14(hexString);
+            break;
+        
+        case 15:
+            if (128 !== actual_len) {
+                throw new Error("Invalid input length for protocol 15: expected 128 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora15(hexString);
+            break;
+        
+        case 16:
+            if (144 !== actual_len) {
+                throw new Error("Invalid input length for protocol 16: expected 144 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora16(hexString);
+            break;
+        
+        case 22:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 22: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora22(hexString);
+            break;
+        
+        case 23:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 23: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora23(hexString);
+            break;
+        
+        case 24:
+            if (176 !== actual_len) {
+                throw new Error("Invalid input length for protocol 24: expected 176 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora24(hexString);
+            break;
+        
+        case 42:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 42: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora42(hexString);
+            break;
+        
+        case 43:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 43: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora43(hexString);
+            break;
+        
+        case 44:
+            if (216 !== actual_len) {
+                throw new Error("Invalid input length for protocol 44: expected 216 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora44(hexString);
+            break;
+        
+        case 50:
+            if (176 !== actual_len) {
+                throw new Error("Invalid input length for protocol 50: expected 176 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora50(hexString);
+            break;
+        
+        case 100:
+            if (384 !== actual_len) {
+                throw new Error("Invalid input length for protocol 100: expected 384 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora100(hexString);
+            break;
+        
+        case 101:
+            if (88 !== actual_len) {
+                throw new Error("Invalid input length for protocol 101: expected 88 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora101(hexString);
+            break;
+        
+        case 102:
+            if (104 !== actual_len) {
+                throw new Error("Invalid input length for protocol 102: expected 104 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora102(hexString);
+            break;
+        
+        case 104:
+            if (408 !== actual_len) {
+                throw new Error("Invalid input length for protocol 104: expected 408 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora104(hexString);
+            break;
+        
+        case 180:
+            if (72 !== actual_len) {
+                throw new Error("Invalid input length for protocol 180: expected 72 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora180(hexString);
+            break;
+        
+        case 181:
+            if (152 !== actual_len) {
+                throw new Error("Invalid input length for protocol 181: expected 152 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora181(hexString);
+            break;
+        
+        case 257:
+            if (40 !== actual_len) {
+                throw new Error("Invalid input length for protocol 257: expected 40 bits, got " + (actual_len) + " bits for the payload " + (hexString));
+            }
+            parsedValues = lora257(hexString);
+            break;
+        
+        default:
+            throw new Error("Unknown protocol: " + (input.fPort));
+    }
+
+    var data = {};
+    for (var i = 0; i < parsedValues.length; i++) {
+        var item = parsedValues[i];
+        data[item.name] = { value: item.value, units: item.units, group: item.group };
+    }
+
+return { data: data };
+}
+
+
+
+
+
+// ===== Datacake wrapper =====
+function _trim(s) { return String(s).replace(/^\s+|\s+$/g, ""); }
+function _isHexString(s) { return /^[0-9a-fA-F]+$/.test(s) && (s.length % 2 === 0); }
+
+function _base64ToBytes(b64) {
+    b64 = _trim(b64);
+    // remove whitespace/newlines
+    b64 = b64.replace(/[^A-Za-z0-9\+\/=]/g, "");
+    // pad to multiple of 4
+    while (b64.length % 4 !== 0) b64 += "=";
+
+    var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    var out = [];
+    var i = 0;
+
+    while (i < b64.length) {
+        var enc1 = chars.indexOf(b64.charAt(i++));
+        var enc2 = chars.indexOf(b64.charAt(i++));
+        var enc3 = chars.indexOf(b64.charAt(i++));
+        var enc4 = chars.indexOf(b64.charAt(i++));
+
+        if (enc1 < 0 || enc2 < 0) break;
+
+        var chr1 = (enc1 << 2) | (enc2 >> 4);
+        out.push(chr1 & 0xFF);
+
+        if (enc3 >= 0 && b64.charAt(i - 2) !== "=") {
+            var chr2 = ((enc2 & 15) << 4) | (enc3 >> 2);
+            out.push(chr2 & 0xFF);
+        }
+
+        if (enc4 >= 0 && b64.charAt(i - 1) !== "=") {
+            var chr3 = ((enc3 & 3) << 6) | enc4;
+            out.push(chr3 & 0xFF);
+        }
+    }
+    return out;
+}
+
+/**
+ * Datacake Payload Decoder entry point.
+ * Supports:
+ *  - bytes array (Datacake normal)
+ *  - hex string
+ *  - base64 string (your frm_payload)
+ */
+function Decoder(payload, port) {
+    var fPort = port;
+    var bytes = payload;
+
+    // 1) Accept "input object" style: {bytes, fPort}
+    if (bytes && typeof bytes === "object" && bytes.bytes !== undefined && (bytes.fPort !== undefined || bytes.f_port !== undefined)) {
+        fPort = (bytes.fPort !== undefined) ? bytes.fPort : bytes.f_port;
+        bytes = bytes.bytes;
+    }
+
+    // 2) Accept full The Things Stack uplink JSON (object)
+    if (bytes && typeof bytes === "object" && bytes.uplink_message && bytes.uplink_message.frm_payload !== undefined) {
+        fPort = (bytes.uplink_message.f_port !== undefined) ? bytes.uplink_message.f_port : fPort;
+        bytes = bytes.uplink_message.frm_payload; // base64
+    }
+
+    // 3) Accept JSON string (paste the whole JSON as a string in test)
+    if (typeof bytes === "string") {
+        var s0 = _trim(bytes);
+        if (s0 && s0.charAt(0) === "{" && s0.charAt(s0.length - 1) === "}") {
+            try {
+                var obj = JSON.parse(s0);
+                return Decoder(obj, fPort);
+            } catch (e0) {
+                // ignore JSON parse errors; continue with normal string handling
+            }
+        }
+    }
+
+    // Datacake provides base64 payload in a global variable `b64payload` (if available).
+    // We'll use it as a fallback when the passed payload length does not match the protocol.
+    var expectedBytesByPort = { 104: 51 }; // protocol 104 expects 408 bits = 51 bytes
+
+    function _byteLen(x) {
+        if (x === undefined || x === null) return null;
+        if (typeof Uint8Array !== "undefined" && x instanceof Uint8Array) return x.length;
+        if (Object.prototype.toString.call(x) === "[object Array]") return x.length;
+        if (typeof x === "string") {
+            var s = _trim(x);
+            if (_isHexString(s)) return s.length / 2;
+            try { return _base64ToBytes(s).length; } catch (e) { return null; }
+        }
+        return null;
+    }
+
+    // Normalize string payload:
+    // - hex string stays hex
+    // - anything else is treated as base64 (frm_payload style)
+    var input = { bytes: bytes, fPort: fPort };
+
+    if (typeof bytes === "string") {
+        var s = _trim(bytes);
+        if (_isHexString(s)) {
+            input.bytes = s;
+        } else {
+            input.bytes = _base64ToBytes(s);
+        }
+    }
+
+    // Fallback to b64payload if we have a known expected length and the provided payload doesn't match.
+    var exp = expectedBytesByPort[fPort];
+    if (exp) {
+        var got = _byteLen(input.bytes);
+        if (got !== null && got !== exp && typeof b64payload === "string" && b64payload.length > 0) {
+            try {
+                var b = _base64ToBytes(b64payload);
+                if (_byteLen(b) === exp) {
+                    input.bytes = b;
+                }
+            } catch (e1) {}
+        }
+    }
+
+    try {
+        var decoded = decodeUplink(input);
+        var out = [];
+        if (decoded && decoded.data) {
+            for (var k in decoded.data) {
+                if (!decoded.data.hasOwnProperty(k)) continue;
+                var v = decoded.data[k];
+                if (v && typeof v === "object" && v.hasOwnProperty("value")) {
+                    var row = { field: k, value: v.value };
+                    if (v.units && v.units !== "none") row.unit = v.units;
+                    out.push(row);
+                } else {
+                    out.push({ field: k, value: v });
+                }
+            }
+        }
+        return out;
+    } catch (e2) {
+        // Return error as a measurement so it's visible in Datacake debug UI
+        return [
+            { field: "DECODER_ERROR", value: String(e2 && e2.message ? e2.message : e2) },
+            { field: "DECODER_PORT", value: fPort },
+            { field: "DECODER_HINT", value: "For f_port=104 you need 51 bytes (102 hex chars). If you copy frm_payload from TTS, it is Base64; convert it to HEX first for manual tests, or let Datacake provide payload as byte array." }
+        ];
+    }
+}
