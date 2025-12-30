@@ -7,7 +7,7 @@ The content is organized by application area to make it easy to navigate, reuse,
 
 The work is grouped into three main categories:
 
-### 1) Node-RED
+### 1) [Node-RED](https://nodered.org/)
 Automation logic, integrations, and UI/dashboard components built in Node-RED.
 - Flows and subflows
 - Examples and documentation for deployment and usage
