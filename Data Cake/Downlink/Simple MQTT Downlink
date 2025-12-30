@@ -1,0 +1,61 @@
+/*
+Datacake Downlink Script (MQTT) — Simple Template
+
+Goal:
+- Read one or multiple Datacake Fields from `measurements.<FIELD_NAME>`
+- Build a JSON payload in the format: { "<FIELD_NAME>": <value>, ... }
+- Publish the payload to an MQTT topic defined in CONFIG
+
+Notes:
+- This script assumes Datacake provides `measurements` object.
+- If a field is missing or null, it will be skipped by default (can be changed).
+*/
+
+// ===== CONFIG =====
+var CONFIG = {
+  // MQTT topic to publish downlink/control payload
+  topic: "your/mqtt/control/topic",
+
+  // List of Datacake fields to read from `measurements`
+  fields: [
+    "FIELD_NAME_1",
+    "FIELD_NAME_2"
+  ],
+
+  // Behavior options
+  skipNull: true,          // skip null/undefined values
+  includeTimestamp: false, // add ts to payload
+  timestampKey: "ts"       // key name if includeTimestamp=true
+};
+
+// ===== BUILD PAYLOAD =====
+var payloadObj = {};
+
+CONFIG.fields.forEach(function (fieldName) {
+  var v = measurements ? measurements[fieldName] : undefined;
+
+  if (CONFIG.skipNull && (v === null || typeof v === "undefined")) {
+    return;
+  }
+
+  payloadObj[fieldName] = v;
+});
+
+if (CONFIG.includeTimestamp) {
+  payloadObj[CONFIG.timestampKey] = Math.floor(Date.now() / 1000);
+}
+
+// If nothing to send, stop here (optional)
+if (Object.keys(payloadObj).length === 0) {
+  return {
+    topic: CONFIG.topic,
+    payload: JSON.stringify({ info: "No valid fields to send" })
+  };
+}
+
+// ===== OUTPUT (Datacake MQTT Downlink format) =====
+// Most Datacake MQTT downlink integrations accept { topic, payload }.
+return {
+  topic: CONFIG.topic,
+  payload: JSON.stringify(payloadObj)
+};
