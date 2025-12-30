@@ -1,0 +1,112 @@
+/*
+HTTP Decoder for Datacake
+
+- Parses incoming HTTP JSON payload (request.body).
+- Generates Datacake field identifiers using the pattern: <MeterNumber>_<Code>
+  Example: 00207158_RoomSensorTemperature
+- Pushes all decoded measurements to a single Datacake device (hub) defined by device_serial.
+- Uses reading.Time (ISO8601) as timestamp for all values in that reading; falls back to current time if missing/invalid.
+- Note: Value.Unit is currently ignored.
+
+Expected payload structure (example):
+{
+  "UnitSerial": "005118",
+  "UnitName": "005118-Cooltechkontor",
+  "ProtocolVersion": 2,
+  "Readings": [
+    {
+      "ID": "LAS00207158-42-10",
+      "MeterNumber": "00207158",
+      "MType": "RoomSensor",
+      "Time": "2025-12-30T05:50:35Z",
+      "Values": [
+        { "Code": "FabricationNumber", "Unit": "None",    "Value": 207158 },
+        { "Code": "SignalStrength",    "Unit": "dBm",     "Value": -60 },
+        { "Code": "RoomSensorTemperature","Unit":"Celcius","Value": 22.17 },
+        ...
+      ]
+    },
+    {
+      "ID": "LAS00202611-27-75",
+      "MeterNumber": "00202611",
+      "MType": "RoomSensor",
+      "Time": "2025-12-30T05:50:36Z",
+      "Values": [
+        { "Code": "FabricationNumber", "Unit": "None",    "Value": 202611 },
+        { "Code": "SignalStrength",    "Unit": "dBm",     "Value": -68 },
+        { "Code": "RoomSensorTemperature","Unit":"Celcius","Value": -0.25 },
+        ...
+      ]
+    }
+  ]
+}
+*/
+
+function Decoder(request) {
+
+    // Datacake Device Serial
+    var device_serial = "Your_Device_Serial";
+
+    // Parse incoming HTTP body as JSON
+    var payload = JSON.parse(request.body);
+
+    // Array that will hold all decoded measurements
+    var result = [];
+
+    // Ensure that Readings exists and is an array
+    if (!payload.Readings || !Array.isArray(payload.Readings)) {
+        console.log("No 'Readings' array found in payload");
+        return result;
+    }
+
+    // Loop through each Reading (each represents one meter)
+    payload.Readings.forEach(function (reading) {
+        var meterNumber = reading.MeterNumber;
+        var values = reading.Values;
+
+        // Skip this Reading if MeterNumber or Values are missing
+        if (!meterNumber || !Array.isArray(values)) {
+            return;
+        }
+
+        // Try to get timestamp from reading.Time (ISO string)
+        var timestamp;
+        if (reading.Time) {
+            var ms = Date.parse(reading.Time);
+            if (!isNaN(ms)) {
+                timestamp = Math.floor(ms / 1000);
+            }
+        }
+
+        // Fallback: use current time if parsing failed
+        if (!timestamp) {
+            timestamp = Math.floor(Date.now() / 1000);
+        }
+
+        // Loop through each value entry for this meter
+        values.forEach(function (v) {
+            // Skip if Code or Value is missing
+            if (!v || typeof v.Code === "undefined" || typeof v.Value === "undefined") {
+                return;
+            }
+
+            var code = String(v.Code);
+            var value = v.Value;
+
+            // Field name pattern: <MeterNumber>_<Code>
+            // Example: 00207158_FabricationNumber
+            var fieldName = String(meterNumber) + "_" + code;
+
+            // Push one Datacake measurement object
+            result.push({
+                device: device_serial,  // all mapped to the same hub device
+                field: fieldName,
+                value: value,
+                timestamp: timestamp
+            });
+        });
+    });
+
+    // Return full measurement list to Datacake
+    return result;
+}
