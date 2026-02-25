@@ -95,7 +95,7 @@ function Decoder(request) {
 
             // Field name pattern: <MeterNumber>_<Code>
             // Example: 00207158_FabricationNumber
-            var fieldName = String(meterNumber) + "_" + code;
+            var fieldName =  code + "_" + String(meterNumber);
 
             // Push one Datacake measurement object
             result.push({
