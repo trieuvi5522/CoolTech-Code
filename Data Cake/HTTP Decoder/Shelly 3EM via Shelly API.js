@@ -1,13 +1,26 @@
 function Decoder(request) {
-//Config Here
-    var DATACAKE_DEVICE = "<Devie Serial Number>";
+    /******************************************************************
+     * CONFIG
+     *
+     * DATACAKE_DEVICE:
+     *   - Serial Number của Device trên Datacake
+     *   - Đây là device đích sẽ chứa toàn bộ field:
+     *       KOKKEN_MALER_TOTAL_CONSUMPTION
+     *       KOKKEN_MALER_ACTIVE_POWER
+     *       ...
+     *
+     * ID_TO_NAME:
+     *   - Map Shelly ID -> Device Name
+     *   - Bạn có thể khai báo 1 hoặc 2 dòng ở đây
+     ******************************************************************/
+    var DATACAKE_DEVICE = "YOUR_DATACAKE_DEVICE_SERIAL_NUMBER";
 
-//Field Structure <Device Name>_<Type>
     var ID_TO_NAME = {
-        "<Shelly Device ID>": "<Device Name>", 
-        "<Shelly Device ID>": "<Device Name>" 
+        "Shelly_Device_ID": "Device_Name",
+        "Shelly_Device_ID": "Device_Name"
+        // thêm tối đa 1 mapping nữa nếu cần
     };
-//End Config
+
     function normalizeDeviceName(name) {
         if (!name) return "UNKNOWN";
 
