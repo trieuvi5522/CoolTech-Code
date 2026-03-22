@@ -2,9 +2,10 @@ function Decoder(request) {
 //Config Here
     var DATACAKE_DEVICE = "<Devie Serial Number>";
 
+//Field Structure <Device Name>_<Type>
     var ID_TO_NAME = {
-        "<Shelly Device ID>": "<Device Name>", //Field Structure <Device Name>_<Type>
-        "<Shelly Device ID>": "<Device Name>"
+        "<Shelly Device ID>": "<Device Name>", 
+        "<Shelly Device ID>": "<Device Name>" 
     };
 //End Config
     function normalizeDeviceName(name) {
